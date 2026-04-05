@@ -1,0 +1,29 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing / typing
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets (adjust names to match what you use)
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
