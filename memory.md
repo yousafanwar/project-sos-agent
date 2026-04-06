@@ -7,3 +7,5 @@ This file is updated after every session.
 - Analysed 'FBR| Federal Board of Revenue - Government of Pakistan ' | Goal: Summarise this page — cover layout, key sections, and main message.
 - Analysed 'PostgreSQL: Documentation: 18: Chapter 7. Queries' | Goal: Give me the H1 heading
 - Analysed 'PostgreSQL: Documentation: 18: Chapter 7. Queries' | Goal: What this website is for?
+- Analysed 'FBR| Federal Board of Revenue - Government of Pakistan' at https://www.fbr.gov.pk/ | Goal: what are the Online Filing Services that this website offers?
+- Analysed 'FBR| Federal Board of Revenue - Government of Pakistan' at https://www.fbr.gov.pk/ | Goal: What online services does this website offers?
