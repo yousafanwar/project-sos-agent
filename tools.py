@@ -1,3 +1,4 @@
+import os
 import base64
 import requests
 from bs4 import BeautifulSoup
@@ -25,6 +26,23 @@ BROWSER_HEADERS = {
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
+
+def _chromium_launch_kwargs() -> dict:
+    """Headed + slowMo when SOS_PLAYWRIGHT_HEADED is set (watch actions on screen)."""
+    headed = os.environ.get("SOS_PLAYWRIGHT_HEADED", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    raw_slow = os.environ.get("SOS_PLAYWRIGHT_SLOW_MO_MS", "").strip()
+    if raw_slow:
+        slow_mo = max(0, int(raw_slow))
+    else:
+        slow_mo = 300 if headed else 0
+    kwargs: dict = {"headless": not headed}
+    if slow_mo > 0:
+        kwargs["slow_mo"] = slow_mo
+    return kwargs
 
 
 def fetch_webpage_text(url: str) -> dict:
@@ -60,7 +78,7 @@ def screenshot_webpage(url: str, path: str = "screenshot.jpg") -> dict:
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
-                headless=True,
+                **_chromium_launch_kwargs(),
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
