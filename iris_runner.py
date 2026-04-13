@@ -57,9 +57,60 @@ class IrisFlowError(Exception):
 def _require_page() -> Page:
     from playwright_tools import _active
 
-    if not _active or not _active.page:
+    if not _active:
         raise RuntimeError("Browser not started")
-    return _active.page
+    # IRIS can replace/close the current tab around login/CAPTCHA.
+    # Rebind to the latest live page when that happens.
+    if _active.page and not _active.page.is_closed():
+        return _active.page
+
+    ctx = getattr(_active, "_context", None)
+    if ctx:
+        for candidate in reversed(ctx.pages):
+            try:
+                if not candidate.is_closed():
+                    _active.page = candidate
+                    return candidate
+            except Exception:
+                continue
+
+    raise RuntimeError("No live Playwright page found")
+
+
+def _adopt_latest_page(prefer_non_dashboard: bool = False) -> Page:
+    """
+    Rebind active page to the most recently opened live page.
+    If prefer_non_dashboard=True, prefer a page whose URL is not /dashboard.
+    """
+    from playwright_tools import _active
+
+    if not _active:
+        raise RuntimeError("Browser not started")
+
+    ctx = getattr(_active, "_context", None)
+    candidates: list[Page] = []
+    if ctx:
+        for p in reversed(ctx.pages):
+            try:
+                if not p.is_closed():
+                    candidates.append(p)
+            except Exception:
+                continue
+
+    if not candidates:
+        return _require_page()
+
+    if prefer_non_dashboard:
+        for p in candidates:
+            try:
+                if "dashboard" not in (p.url or "").lower():
+                    _active.page = p
+                    return p
+            except Exception:
+                continue
+
+    _active.page = candidates[0]
+    return candidates[0]
 
 
 def log_step(state: str, action: str, result: str, notes: str = "") -> None:
@@ -125,7 +176,7 @@ def load_iris_config() -> dict[str, Any]:
         salary = json.loads(sal_raw)
     except json.JSONDecodeError as e:
         raise IrisFlowError("IDLE", f"Invalid IRIS_SALARY_JSON: {e}", "escalated") from e
-    captcha_timeout_ms = int(os.getenv("IRIS_CAPTCHA_TIMEOUT_MS", "600000"))
+    captcha_timeout_ms = int(os.getenv("IRIS_CAPTCHA_TIMEOUT_MS", "240000"))
     return {
         "cnic": cnic,
         "password": password,
@@ -442,37 +493,288 @@ def step_login(cfg: dict[str, Any]) -> None:
 
 
 def step_wait_human_captcha(cfg: dict[str, Any]) -> None:
-    page = _require_page()
     print(
         "\n>>> Solve the CAPTCHA in the browser window, then wait for the dashboard.\n"
         ">>> (No timeout print spam — this step can take several minutes.)\n"
     )
     timeout = cfg["captcha_timeout_ms"]
+    dashboard_pattern = re.compile(
+        r"Simplified\s+Income(?:\s+Tax)?\s+Return(?:\s+for\s+Individuals)?",
+        re.I,
+    )
+    post_login_pattern = re.compile(
+        r"dashboard|tax\s*period|simplified\s*return|declaration|residen",
+        re.I,
+    )
+    deadline = time.monotonic() + timeout / 1000.0
+    last_error: Optional[Exception] = None
+    next_status_log_at = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            page = _adopt_latest_page(prefer_non_dashboard=True)
+            # Fast path: exact dashboard card visible.
+            loc = page.get_by_text(dashboard_pattern).first
+            if loc.count() > 0 and loc.is_visible():
+                log_step("HUMAN_CAPTCHA_WAIT", "dashboard visible", "success", "")
+                return
+            # Fallback: session is clearly past login/CAPTCHA and app is in post-login UI.
+            url = page.url or ""
+            body = page.locator("body").inner_text(timeout=2_000)
+            if ("login" not in url.lower()) and post_login_pattern.search(body or ""):
+                log_step(
+                    "HUMAN_CAPTCHA_WAIT",
+                    "post-login UI detected (dashboard/text variant)",
+                    "success",
+                    f"url={url}",
+                )
+                return
+            now = time.monotonic()
+            if now >= next_status_log_at:
+                title = ""
+                try:
+                    title = page.title()
+                except Exception:
+                    pass
+                print(f"[wait] still waiting after CAPTCHA | url={url!r} | title={title!r}")
+                next_status_log_at = now + 10.0
+        except Exception as e:
+            last_error = e
+        time.sleep(0.6)
+
+    msg = f"Dashboard did not appear within {timeout} ms"
+    if last_error:
+        msg += f": {last_error}"
+    raise IrisFlowError("HUMAN_CAPTCHA_WAIT", msg, "escalated")
+
+
+def _open_simplified_return_tile(page: Page) -> None:
+    pattern = re.compile(
+        r"Simplified\s+Income(?:\s+Tax)?\s+Return(?:\s+for\s+Individuals)?",
+        re.I,
+    )
+    # Try role-first selectors, then broad text/locator fallback.
+    for locator in (
+        page.get_by_role("link", name=pattern).first,
+        page.get_by_role("button", name=pattern).first,
+        page.get_by_text(pattern).first,
+        page.locator("a, button, div, span").filter(has_text=pattern).first,
+    ):
+        try:
+            locator.wait_for(state="visible", timeout=8_000)
+            locator.click(timeout=12_000)
+            return
+        except Exception:
+            continue
+
+    # Fallback for IRIS card UIs where text node is not the clickable node.
     try:
-        page.get_by_text(
-            re.compile(r"Simplified\s+Income\s+Tax\s+Return\s+for\s+Individuals", re.I)
-        ).first.wait_for(state="visible", timeout=timeout)
-    except PlaywrightTimeoutError as e:
-        raise IrisFlowError(
-            "HUMAN_CAPTCHA_WAIT",
-            f"Dashboard did not appear within {timeout} ms: {e}",
-            "escalated",
-        ) from e
-    log_step("HUMAN_CAPTCHA_WAIT", "dashboard visible", "success", "")
+        clicked = page.evaluate(
+            """() => {
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const target = 'simplified income tax return for individuals';
+                const alt = 'simplified income tax return';
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 10 && r.height > 10;
+                };
+                const nodes = Array.from(document.querySelectorAll('*'));
+                for (const n of nodes) {
+                    const t = norm(n.innerText || n.textContent || '');
+                    if (!(t.includes(target) || t.includes(alt))) continue;
+                    let c = n;
+                    for (let i = 0; i < 6 && c; i++) {
+                        if (
+                            c.matches?.('a,button,[role="button"],.ui-card,.p-card,.tile,.dashboard-card,.menu-item,li,div')
+                            && isVisible(c)
+                        ) {
+                            c.scrollIntoView({ block: 'center', inline: 'center' });
+                            c.click();
+                            return true;
+                        }
+                        c = c.parentElement;
+                    }
+                }
+                return false;
+            }"""
+        )
+        if clicked:
+            page.wait_for_timeout(1000)
+            return
+    except Exception:
+        pass
+
+    # Last fallback: click the center of the text-containing visible block.
+    try:
+        loc = page.locator("div, li, a, button, span").filter(has_text=pattern).first
+        loc.wait_for(state="visible", timeout=5_000)
+        box = loc.bounding_box()
+        if box:
+            page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            page.wait_for_timeout(900)
+            return
+    except Exception:
+        pass
+
+    # Final deterministic fallback: click the first (top-left) dashboard tile.
+    try:
+        clicked_first_tile = page.evaluate(
+            """() => {
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 140 && r.height > 70 && r.top >= 80 && r.top <= 420;
+                };
+                const clickable = (el) => {
+                    if (!el) return false;
+                    const role = (el.getAttribute('role') || '').toLowerCase();
+                    const cls = (el.className || '').toString().toLowerCase();
+                    const st = window.getComputedStyle(el);
+                    return (
+                        el.tagName === 'A' ||
+                        el.tagName === 'BUTTON' ||
+                        role === 'button' ||
+                        !!el.getAttribute('onclick') ||
+                        st.cursor === 'pointer' ||
+                        cls.includes('card') ||
+                        cls.includes('tile') ||
+                        cls.includes('menu')
+                    );
+                };
+                const els = Array.from(document.querySelectorAll('a,button,div,li,section,article'))
+                    .filter((el) => isVisible(el) && clickable(el))
+                    .map((el) => ({ el, r: el.getBoundingClientRect() }))
+                    // keep upper dashboard area where tiles are shown
+                    .filter((x) => x.r.top >= 90 && x.r.top <= 360 && x.r.left >= 0 && x.r.left <= 520);
+                if (!els.length) return false;
+                els.sort((a, b) => (a.r.top - b.r.top) || (a.r.left - b.r.left));
+                const target = els[0].el;
+                target.scrollIntoView({ block: 'center', inline: 'center' });
+                target.click();
+                return true;
+            }"""
+        )
+        if clicked_first_tile:
+            page.wait_for_timeout(1200)
+            return
+    except Exception:
+        pass
+    raise IrisFlowError(
+        "DASHBOARD",
+        "Could not find/click the Simplified Income Return tile on dashboard",
+        "escalated",
+    )
+
+
+def _is_tax_period_context(page: Page) -> bool:
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        url = ""
+    # If we already left dashboard/login, we are in post-dashboard flow.
+    if url and ("dashboard" not in url) and ("login" not in url):
+        return True
+    try:
+        txt = page.locator("body").inner_text(timeout=2_500)
+    except Exception:
+        return False
+    return bool(
+        re.search(r"tax\s*period|simplified\s*return\s*for\s*individuals|already.*submitted", txt, re.I)
+    )
+
+
+def _click_first_simplified_tile_by_box(page: Page) -> bool:
+    """Click top-left Simplified tile by bounding box when normal click doesn't navigate."""
+    pattern = re.compile(r"Simplified\s+Income\s+Tax\s+Return", re.I)
+    try:
+        label = page.locator("div, span, p, h1, h2, h3, h4").filter(has_text=pattern).first
+        label.wait_for(state="visible", timeout=5_000)
+        box = label.bounding_box()
+        if not box:
+            return False
+        # Click slightly left/up from label center (inside first tile container).
+        x = max(10, box["x"] - 60)
+        y = max(10, box["y"] + 10)
+        page.mouse.click(x, y)
+        page.wait_for_timeout(1200)
+        return True
+    except Exception:
+        return False
+
+
+def _click_first_simplified_tile_by_coordinates(page: Page) -> bool:
+    """
+    Hard fallback: click likely points inside the first dashboard tile.
+    Uses fixed coordinates relative to known viewport/layout.
+    """
+    points = [
+        (140, 185),
+        (170, 170),
+        (110, 195),
+        (210, 155),
+    ]
+    for x, y in points:
+        try:
+            page.mouse.click(x, y)
+            page.wait_for_timeout(700)
+            if _is_tax_period_context(page):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def step_dashboard() -> None:
-    page = _require_page()
-    page.get_by_text(
-        re.compile(r"Simplified\s+Income\s+Tax\s+Return\s+for\s+Individuals", re.I)
-    ).first.click(timeout=30_000)
-    log_step("DASHBOARD", "opened Simplified Return tile", "success", "")
+    page = _adopt_latest_page(prefer_non_dashboard=False)
+    # If portal already opened the next dialog/state, don't force-click dashboard tile.
+    if _is_tax_period_context(page):
+        log_step("DASHBOARD", "already in tax-period state; skipping tile click", "success", "")
+        return
+
+    for attempt in range(1, 4):
+        log_step("DASHBOARD", f"open tile attempt {attempt}/3", "partial_complete", f"url={page.url}")
+        # First: force-click exact text in the tile.
+        try:
+            txt = page.get_by_text(
+                re.compile(r"Simplified\s+Income\s+Tax\s+Return\s+For\s+Individuals", re.I)
+            ).first
+            txt.click(timeout=5_000, force=True)
+            page.wait_for_timeout(600)
+        except Exception:
+            pass
+        _open_simplified_return_tile(page)
+        page = _adopt_latest_page(prefer_non_dashboard=True)
+        if _is_tax_period_context(page):
+            log_step("DASHBOARD", "opened Simplified Return tile", "success", "")
+            return
+        _click_first_simplified_tile_by_box(page)
+        page = _adopt_latest_page(prefer_non_dashboard=True)
+        if _is_tax_period_context(page):
+            log_step("DASHBOARD", "opened Simplified Return tile", "success", "")
+            return
+        if _click_first_simplified_tile_by_coordinates(page):
+            page = _adopt_latest_page(prefer_non_dashboard=True)
+            log_step("DASHBOARD", "opened Simplified Return tile", "success", "")
+            return
+        page.wait_for_timeout(700)
+
+    raise IrisFlowError(
+        "DASHBOARD",
+        "Clicked Simplified Return tile but Tax Period dialog did not open",
+        "escalated",
+    )
 
 
 def step_tax_period(cfg: dict[str, Any]) -> None:
-    page = _require_page()
+    page = _adopt_latest_page(prefer_non_dashboard=True)
+    log_step("TAX_PERIOD_SELECTION", "enter step", "partial_complete", f"url={page.url}")
+    if not _is_tax_period_context(page):
+        # Sometimes dashboard remains visible; trigger tile again from here as safety.
+        step_dashboard()
+        page = _adopt_latest_page(prefer_non_dashboard=True)
     page.wait_for_timeout(1500)
     tax_year = cfg["tax_year"]
+    field_timeout = int(os.getenv("IRIS_TAX_PERIOD_FIELD_TIMEOUT_MS", "12000"))
     body = page.locator("body")
     already = body.get_by_text(
         re.compile(r"already.*submitted|already\s+been\s+filed", re.I)
@@ -525,7 +827,15 @@ def step_tax_period(cfg: dict[str, Any]) -> None:
             except Exception:
                 continue
     if not filled_year:
-        page.locator('input[type="text"]').first.fill(tax_year)
+        try:
+            page.locator('input[type="text"]').first.fill(tax_year, timeout=field_timeout)
+            filled_year = True
+        except Exception as e:
+            raise IrisFlowError(
+                "TAX_PERIOD_SELECTION",
+                f"Tax period input not visible after dashboard click ({field_timeout}ms): {e}",
+                "escalated",
+            ) from e
 
     page.wait_for_timeout(500)
     label = cfg.get("tax_period_label") or ""
