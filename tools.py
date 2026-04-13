@@ -83,7 +83,7 @@ def screenshot_webpage(url: str, path: str = "screenshot.jpg") -> dict:
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
-                    "--disable-gpu",
+                    # "--disable-gpu",
                 ],
             )
 

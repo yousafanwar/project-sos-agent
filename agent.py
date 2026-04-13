@@ -26,21 +26,31 @@ def _check_config():
 # ***** Load agent brain & memory *****
 def load_context() -> str:
     try:
-        with open("agents.md", "r") as f:
+        with open("agent.md", "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
         return "You are a helpful web research agent. Analyse pages thoroughly."
 
+# def load_memory() -> str:
+#     try:
+#         with open("memory.md", "r") as f:
+#             return f.read().strip()
+#     except FileNotFoundError:
+#         return "No memory yet."
+
+# def update_memory(entry: str):
+#     with open("memory.md", "a") as f:
+#         f.write(f"\n- {entry}")
 
 def load_memory() -> str:
     try:
-        with open("memory.md", "r") as f:
+        with open("memory.md", "r", encoding="utf-8") as f:
             return f.read().strip()
     except FileNotFoundError:
         return "No memory yet."
 
 def update_memory(entry: str):
-    with open("memory.md", "a") as f:
+    with open("memory.md", "a", encoding="utf-8") as f:
         f.write(f"\n- {entry}")
 
 
@@ -160,8 +170,13 @@ def run_agent(url: str, goal: str) -> str:
 
 # ***** Entry point *****
 if __name__ == "__main__":
-    _url  = input("Enter a URL: ").strip()
-    _goal = input("What do you want to know? (Enter for default): ").strip()
-    if not _goal:
-        _goal = "Summarise this page — cover layout, key sections, and main message."
-    run_agent(_url, _goal)
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ("iris", "--iris"):
+        from iris_runner import main as iris_main
+
+        iris_main()
+    else:
+        _url = input("Enter a URL: ").strip()
+        _goal = input("What do you want to know? (Enter for default): ").strip()
+        if not _goal:
+            _goal = "Summarise this page — cover layout, key sections, and main message."
+        run_agent(_url, _goal)
