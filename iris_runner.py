@@ -23,9 +23,65 @@ from playwright_tools import (
     PlaywrightToolContext,
     confidence_score,
     playwright_goto,
+    playwright_screenshot,
+    vision_identify,
 )
 
 IRIS_LOGIN_URL = "https://iris.fbr.gov.pk/login"
+
+# Dashboard tile: default DOM match (full wording on IRIS).
+_SIMPLIFIED_RETURN_PHRASE_RE = re.compile(
+    r"Simplified\s+Income\s+Tax\s+Return\s+for\s+Individuals",
+    re.I,
+)
+
+_VISION_DASHBOARD_PROMPT = """You are helping automate the IRIS tax portal (Pakistan FBR) in a browser.
+Look at this screenshot. Determine whether the post-login IRIS home/dashboard is shown (not the login form, not only a CAPTCHA dialog).
+
+If you see a tile, card, or link for the individual simplified income tax return (often mentions "Simplified", "Income Tax", "Individuals"), report the visible label text as precisely as you can (one string).
+
+Reply with ONLY a single JSON object (no markdown fences, no commentary). Use this exact shape:
+{"on_iris_dashboard": false, "simplified_return_tile_visible": false, "tile_visible_text": "", "notes": ""}
+
+Rules:
+- "tile_visible_text" must be the on-screen wording you see for that entry (or empty if absent).
+- If unsure, set booleans false and explain briefly in "notes".
+"""
+
+
+def _append_memory_md(line: str) -> None:
+    """Append one bullet line for IRIS / session learnings (same file as agent.py)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory.md")
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n- {line.strip()}\n")
+    except OSError:
+        pass
+
+
+def _parse_vision_json_object(raw: str) -> Optional[dict[str, Any]]:
+    s = (raw or "").strip()
+    if "```" in s:
+        parts = s.split("```")
+        for block in parts[1::2]:
+            block = block.strip()
+            if block.lower().startswith("json"):
+                block = block[4:].lstrip()
+            s = block.strip()
+            break
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        pass
+    start, end = s.find("{"), s.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            obj = json.loads(s[start : end + 1])
+            return obj if isinstance(obj, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None
 
 # Password field: standard attrs, PrimeNG (p-password), optional shadow hosts.
 _PWD_SELECTOR = ",".join(
@@ -126,6 +182,7 @@ def load_iris_config() -> dict[str, Any]:
     except json.JSONDecodeError as e:
         raise IrisFlowError("IDLE", f"Invalid IRIS_SALARY_JSON: {e}", "escalated") from e
     captcha_timeout_ms = int(os.getenv("IRIS_CAPTCHA_TIMEOUT_MS", "600000"))
+    dashboard_quick_timeout_ms = int(os.getenv("IRIS_DASHBOARD_QUICK_MS", "45000"))
     return {
         "cnic": cnic,
         "password": password,
@@ -133,6 +190,7 @@ def load_iris_config() -> dict[str, Any]:
         "income_sources": income_sources,
         "salary": salary,
         "captcha_timeout_ms": captcha_timeout_ms,
+        "dashboard_quick_timeout_ms": max(5_000, dashboard_quick_timeout_ms),
         "tax_period_label": os.getenv("IRIS_TAX_PERIOD_LABEL", "").strip(),
     }
 
@@ -441,32 +499,141 @@ def step_login(cfg: dict[str, Any]) -> None:
     log_step("LOGIN_PAGE", "submitted login form", "success", "await human CAPTCHA")
 
 
+def _remaining_ms(deadline: float) -> int:
+    return max(0, int((deadline - time.monotonic()) * 1000))
+
+
 def step_wait_human_captcha(cfg: dict[str, Any]) -> None:
     page = _require_page()
+    cfg.pop("iris_simplified_return_click", None)
+
     print(
         "\n>>> Solve the CAPTCHA in the browser window, then wait for the dashboard.\n"
         ">>> (No timeout print spam — this step can take several minutes.)\n"
     )
-    timeout = cfg["captcha_timeout_ms"]
+    total_ms = cfg["captcha_timeout_ms"]
+    quick_ms = min(cfg["dashboard_quick_timeout_ms"], total_ms)
+    deadline = time.monotonic() + total_ms / 1000.0
+    dom = page.get_by_text(_SIMPLIFIED_RETURN_PHRASE_RE).first
+
+    def wait_phrase(ms: int) -> bool:
+        if ms <= 0:
+            return False
+        try:
+            dom.wait_for(state="visible", timeout=ms)
+            return True
+        except PlaywrightTimeoutError:
+            return False
+
+    if wait_phrase(min(quick_ms, _remaining_ms(deadline))):
+        log_step("HUMAN_CAPTCHA_WAIT", "dashboard visible (default phrase)", "success", "")
+        return
+
+    rem = _remaining_ms(deadline)
+    if rem < 5_000:
+        raise IrisFlowError(
+            "HUMAN_CAPTCHA_WAIT",
+            "Dashboard did not appear within captcha timeout (quick phase exhausted budget).",
+            "escalated",
+        )
+
+    print(
+        ">>> Default dashboard phrase not visible yet — capturing screenshot for NVIDIA vision.\n"
+    )
+    vision_notes = ""
     try:
-        page.get_by_text(
-            re.compile(r"Simplified\s+Income\s+Tax\s+Return\s+for\s+Individuals", re.I)
-        ).first.wait_for(state="visible", timeout=timeout)
+        b64 = playwright_screenshot()
+        vr = vision_identify(b64, _VISION_DASHBOARD_PROMPT)
+        if not vr.get("success"):
+            vision_notes = str(vr.get("error", "vision_identify failed"))
+            log_step(
+                "HUMAN_CAPTCHA_WAIT",
+                "NVIDIA vision fallback",
+                "partial_complete",
+                vision_notes,
+            )
+        else:
+            raw = str(vr.get("text", "")).strip()
+            parsed = _parse_vision_json_object(raw)
+            if parsed is None:
+                vision_notes = "could not parse vision JSON"
+                log_step(
+                    "HUMAN_CAPTCHA_WAIT",
+                    "NVIDIA vision fallback",
+                    "partial_complete",
+                    vision_notes,
+                )
+            else:
+                tile = str(parsed.get("tile_visible_text", "") or "").strip()
+                vis = bool(parsed.get("simplified_return_tile_visible"))
+                on_dash = bool(parsed.get("on_iris_dashboard"))
+                vision_notes = str(parsed.get("notes", "") or "").strip()
+                looks_like_tile = bool(
+                    # re.search(r"simplified|income\s+tax|individual", tile, re.I)
+                    re.search(r"inbox", tile, re.I)
+                )
+                if tile and (vis or on_dash or (len(tile) >= 10 and looks_like_tile)):
+                    # Substring match is more resilient than the full static regex.
+                    cfg["iris_simplified_return_click"] = tile[:200]
+                    log_step(
+                        "HUMAN_CAPTCHA_WAIT",
+                        "NVIDIA interpreted screenshot",
+                        "success",
+                        f"tile_visible_text={tile[:80]!r}"
+                        + (f"; notes={vision_notes[:120]}" if vision_notes else ""),
+                    )
+    except Exception as e:
+        vision_notes = repr(e)
+        log_step(
+            "HUMAN_CAPTCHA_WAIT",
+            "NVIDIA vision fallback",
+            "partial_complete",
+            vision_notes,
+        )
+
+    hint = cfg.get("iris_simplified_return_click")
+    if hint:
+        try:
+            page.get_by_text(hint, exact=False).first.wait_for(
+                state="visible", timeout=_remaining_ms(deadline)
+            )
+            _append_memory_md(
+                "IRIS (iris.fbr.gov.pk): After the quick DOM wait, NVIDIA vision read the "
+                "dashboard screenshot and reported the Simplified Return entry as "
+                f"{hint!r}; Playwright matched that text and continued."
+            )
+            log_step(
+                "HUMAN_CAPTCHA_WAIT",
+                "dashboard visible (NVIDIA-derived label)",
+                "success",
+                "",
+            )
+            return
+        except PlaywrightTimeoutError:
+            cfg.pop("iris_simplified_return_click", None)
+
+    try:
+        dom.wait_for(state="visible", timeout=_remaining_ms(deadline))
     except PlaywrightTimeoutError as e:
         raise IrisFlowError(
             "HUMAN_CAPTCHA_WAIT",
-            f"Dashboard did not appear within {timeout} ms: {e}",
+            f"Dashboard did not appear within {total_ms} ms: {e}",
             "escalated",
         ) from e
-    log_step("HUMAN_CAPTCHA_WAIT", "dashboard visible", "success", "")
+    log_step("HUMAN_CAPTCHA_WAIT", "dashboard visible (default phrase)", "success", "")
 
 
-def step_dashboard() -> None:
+def step_dashboard(cfg: dict[str, Any]) -> None:
     page = _require_page()
-    page.get_by_text(
-        re.compile(r"Simplified\s+Income\s+Tax\s+Return\s+for\s+Individuals", re.I)
-    ).first.click(timeout=30_000)
-    log_step("DASHBOARD", "opened Simplified Return tile", "success", "")
+    label = (cfg.get("iris_simplified_return_click") or "").strip() or None
+
+    if label:
+        page.get_by_text(str(label), exact=False).first.click(timeout=30_000)
+        log_step("DASHBOARD", "opened Simplified Return tile", "success", "NVIDIA-derived label")
+    else:
+        page.get_by_text(_SIMPLIFIED_RETURN_PHRASE_RE).first.click(timeout=30_000)
+        log_step("DASHBOARD", "opened Simplified Return tile", "success", "default phrase")
+
 
 
 def step_tax_period(cfg: dict[str, Any]) -> None:
@@ -852,7 +1019,7 @@ def run_iris_flow() -> int:
             step_login(cfg)
             step_wait_human_captcha(cfg)
 
-        step_dashboard()
+        step_dashboard(cfg)
         step_tax_period(cfg)
         step_start_residency()
         step_income_sources()

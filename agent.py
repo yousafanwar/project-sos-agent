@@ -14,8 +14,10 @@ from tools import fetch_webpage_text, screenshot_webpage
 
 
 # ***** Config *****
-NVIDIA_API_KEY   = os.getenv("NVIDIA_API_KEY")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 NVIDIA_INVOKE_URL = os.getenv("NVIDIA_INVOKE_URL")
+# build.nvidia.com default; set NVIDIA_MODEL in .env if NVIDIA rotates catalog ids.
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.2-90b-vision-instruct").strip()
 
 def _check_config():
     """Fail fast if required env vars are missing."""
@@ -26,7 +28,7 @@ def _check_config():
 # ***** Load agent brain & memory *****
 def load_context() -> str:
     try:
-        with open("agent.md", "r", encoding="utf-8") as f:
+        with open("agent.md", "r", encoding="utf-8", errors="replace") as f:
             return f.read()
     except FileNotFoundError:
         return "You are a helpful web research agent. Analyse pages thoroughly."
@@ -44,7 +46,7 @@ def load_context() -> str:
 
 def load_memory() -> str:
     try:
-        with open("memory.md", "r", encoding="utf-8") as f:
+        with open("memory.md", "r", encoding="utf-8", errors="replace") as f:
             return f.read().strip()
     except FileNotFoundError:
         return "No memory yet."
@@ -54,7 +56,7 @@ def update_memory(entry: str):
         f.write(f"\n- {entry}")
 
 
-# ***** THINK: call phi-3.5-vision-instruct *****
+# ***** THINK: NVIDIA vision chat completions *****
 def think(image_b64: str, text_content: str, goal: str) -> str:
     """
     Sends the page screenshot + extracted text to the NVIDIA vision model
@@ -91,7 +93,7 @@ Focus on: layout, headings, buttons, forms, key messages, and page structure.
     }
 
     payload = {
-        "model": "microsoft/phi-3.5-vision-instruct",
+        "model": NVIDIA_MODEL or "meta/llama-3.2-90b-vision-instruct",
         "messages": [
             {
                 "role": "user",

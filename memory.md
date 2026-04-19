@@ -9,3 +9,7 @@ This file is updated after every session.
 - Analysed 'PostgreSQL: Documentation: 18: Chapter 7. Queries' | Goal: What this website is for?
 - Analysed 'FBR| Federal Board of Revenue - Government of Pakistan' at https://www.fbr.gov.pk/ | Goal: what are the Online Filing Services that this website offers?
 - Analysed 'FBR| Federal Board of Revenue - Government of Pakistan' at https://www.fbr.gov.pk/ | Goal: What online services does this website offers?
+- Analysed 'Swagger UI' at https://unitygame.carspotnl.com/api | Goal: what this webpage is about?
+- Analysed 'Swagger UI' at https://unitygame.carspotnl.com/api | Goal: What this website is about?
+- Analysed 'Swagger UI' at https://unitygame.carspotnl.com/api | Goal: get me the h1 heading
+- Analysed 'Swagger UI' at https://unitygame.carspotnl.com/api | Goal: What this website is about?

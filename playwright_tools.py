@@ -189,8 +189,9 @@ def vision_identify(screenshot_b64: str, question: str) -> dict[str, Any]:
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    model = os.getenv("NVIDIA_MODEL", "meta/llama-3.2-90b-vision-instruct").strip()
     payload = {
-        "model": "microsoft/phi-3.5-vision-instruct",
+        "model": model or "meta/llama-3.2-90b-vision-instruct",
         "messages": [
             {
                 "role": "user",
