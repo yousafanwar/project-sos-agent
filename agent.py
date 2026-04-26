@@ -17,7 +17,8 @@ from tools import fetch_webpage_text, screenshot_webpage
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 NVIDIA_INVOKE_URL = os.getenv("NVIDIA_INVOKE_URL")
 # build.nvidia.com default; set NVIDIA_MODEL in .env if NVIDIA rotates catalog ids.
-NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.2-90b-vision-instruct").strip()
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "google/gemma-3-27b-it").strip()
+stream=True
 
 def _check_config():
     """Fail fast if required env vars are missing."""
@@ -89,11 +90,11 @@ Focus on: layout, headings, buttons, forms, key messages, and page structure.
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
         "Content-Type": "application/json",
-        "Accept": "text/event-stream",
+        "Accept": "text/event-stream" if stream else "application/json",
     }
 
     payload = {
-        "model": NVIDIA_MODEL or "meta/llama-3.2-90b-vision-instruct",
+        "model": NVIDIA_MODEL,
         "messages": [
             {
                 "role": "user",
@@ -103,10 +104,10 @@ Focus on: layout, headings, buttons, forms, key messages, and page structure.
                 ),
             }
         ],
-        "max_tokens": 1024,
+        "max_tokens": 512,
         "temperature": 0.20,
         "top_p": 0.70,
-        "stream": True,
+        "stream": stream,
     }
 
     try:
