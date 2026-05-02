@@ -27,7 +27,19 @@ from playwright_tools import (
     vision_identify,
 )
 
-IRIS_LOGIN_URL = "https://iris.fbr.gov.pk/login"
+# IRIS_LOGIN_URL = "https://iris.fbr.gov.pk/login"
+IRIS_LOGIN_URL = "http://localhost:5173"
+
+# Default Playwright / flow timeouts (ms). Override with IRIS_TIMEOUT_MS (e.g. 30000).
+_T = int(os.getenv("IRIS_TIMEOUT_MS", "10000"))
+
+
+def _tw(ms: int | None = None) -> int:
+    """Cap any wait to at most _T ms (fast workflows)."""
+    if ms is None:
+        return _T
+    return min(_T, max(0, ms))
+
 
 # Dashboard tile: default DOM match (full wording on IRIS).
 _SIMPLIFIED_RETURN_PHRASE_RE = re.compile(
@@ -181,8 +193,9 @@ def load_iris_config() -> dict[str, Any]:
         salary = json.loads(sal_raw)
     except json.JSONDecodeError as e:
         raise IrisFlowError("IDLE", f"Invalid IRIS_SALARY_JSON: {e}", "escalated") from e
-    captcha_timeout_ms = int(os.getenv("IRIS_CAPTCHA_TIMEOUT_MS", "600000"))
-    dashboard_quick_timeout_ms = int(os.getenv("IRIS_DASHBOARD_QUICK_MS", "45000"))
+    captcha_timeout_ms = int(os.getenv("IRIS_CAPTCHA_TIMEOUT_MS", str(_T)))
+    dashboard_quick_timeout_ms = int(os.getenv("IRIS_DASHBOARD_QUICK_MS", str(_T)))
+    dashboard_quick_timeout_ms = min(captcha_timeout_ms, max(1, dashboard_quick_timeout_ms))
     return {
         "cnic": cnic,
         "password": password,
@@ -190,13 +203,13 @@ def load_iris_config() -> dict[str, Any]:
         "income_sources": income_sources,
         "salary": salary,
         "captcha_timeout_ms": captcha_timeout_ms,
-        "dashboard_quick_timeout_ms": max(5_000, dashboard_quick_timeout_ms),
+        "dashboard_quick_timeout_ms": dashboard_quick_timeout_ms,
         "tax_period_label": os.getenv("IRIS_TAX_PERIOD_LABEL", "").strip(),
     }
 
 
 def _login_field_timeout_ms() -> int:
-    return int(os.getenv("IRIS_LOGIN_FIELD_TIMEOUT_MS", "90000"))
+    return int(os.getenv("IRIS_LOGIN_FIELD_TIMEOUT_MS", str(_T)))
 
 
 def _page_and_frames(page: Page) -> list[Root]:
@@ -378,14 +391,14 @@ def _fill_first_text_then_password(page: Page, cnic: str, password: str) -> None
     timeout = _login_field_timeout_ms()
     page.wait_for_timeout(800)
     try:
-        page.wait_for_load_state("networkidle", timeout=min(timeout, 90_000))
+        page.wait_for_load_state("networkidle", timeout=_tw(timeout))
     except Exception:
         pass
     page.wait_for_timeout(500)
 
     # Wait for password in document (covers slow SPA + open shadow roots on main frame).
     try:
-        _wait_for_password_in_dom(page, min(timeout, 120_000))
+        _wait_for_password_in_dom(page, _tw(timeout))
     except PlaywrightTimeoutError:
         pass
 
@@ -402,12 +415,12 @@ def _fill_first_text_then_password(page: Page, cnic: str, password: str) -> None
             if _fill_cnic_on_root(root, cnic):
                 page.wait_for_timeout(1500)
                 try:
-                    page.wait_for_load_state("networkidle", timeout=20_000)
+                    page.wait_for_load_state("networkidle", timeout=_T)
                 except Exception:
                     pass
                 break
         try:
-            _wait_for_password_in_dom(page, min(45_000, timeout))
+            _wait_for_password_in_dom(page, _tw(timeout))
         except PlaywrightTimeoutError:
             pass
         for root in _page_and_frames(page):
@@ -464,7 +477,7 @@ def _click_login_on_root(root: Root) -> bool:
                 first.click()
                 return True
     try:
-        root.get_by_role("button", name=re.compile(r"login", re.I)).first.click(timeout=5_000)
+        root.get_by_role("button", name=re.compile(r"login", re.I)).first.click(timeout=_T)
         return True
     except Exception:
         return False
@@ -474,7 +487,7 @@ def _click_login(page: Page) -> None:
     for root in _page_and_frames(page):
         if _click_login_on_root(root):
             return
-    page.get_by_role("button", name=re.compile(r"login", re.I)).first.click()
+    page.get_by_role("button", name=re.compile(r"login", re.I)).first.click(timeout=_T)
 
 
 def step_login(cfg: dict[str, Any]) -> None:
@@ -490,7 +503,7 @@ def step_login(cfg: dict[str, Any]) -> None:
     try:
         page.wait_for_url(
             lambda url: "login" not in url.lower(),
-            timeout=30_000,
+            timeout=_T,
             wait_until="domcontentloaded",
         )
     except Exception:
@@ -509,7 +522,7 @@ def step_wait_human_captcha(cfg: dict[str, Any]) -> None:
 
     print(
         "\n>>> Solve the CAPTCHA in the browser window, then wait for the dashboard.\n"
-        ">>> (No timeout print spam — this step can take several minutes.)\n"
+        f">>> (Timeouts default to {_T // 1000}s — set IRIS_TIMEOUT_MS / IRIS_CAPTCHA_TIMEOUT_MS to extend.)\n"
     )
     total_ms = cfg["captcha_timeout_ms"]
     quick_ms = min(cfg["dashboard_quick_timeout_ms"], total_ms)
@@ -525,12 +538,12 @@ def step_wait_human_captcha(cfg: dict[str, Any]) -> None:
         except PlaywrightTimeoutError:
             return False
 
-    if wait_phrase(min(quick_ms, _remaining_ms(deadline))):
+    if wait_phrase(_tw(min(quick_ms, _remaining_ms(deadline)))):
         log_step("HUMAN_CAPTCHA_WAIT", "dashboard visible (default phrase)", "success", "")
         return
 
     rem = _remaining_ms(deadline)
-    if rem < 5_000:
+    if rem < max(100, _T // 10):
         raise IrisFlowError(
             "HUMAN_CAPTCHA_WAIT",
             "Dashboard did not appear within captcha timeout (quick phase exhausted budget).",
@@ -595,7 +608,7 @@ def step_wait_human_captcha(cfg: dict[str, Any]) -> None:
     if hint:
         try:
             page.get_by_text(hint, exact=False).first.wait_for(
-                state="visible", timeout=_remaining_ms(deadline)
+                state="visible", timeout=_tw(_remaining_ms(deadline))
             )
             _append_memory_md(
                 "IRIS (iris.fbr.gov.pk): After the quick DOM wait, NVIDIA vision read the "
@@ -613,7 +626,7 @@ def step_wait_human_captcha(cfg: dict[str, Any]) -> None:
             cfg.pop("iris_simplified_return_click", None)
 
     try:
-        dom.wait_for(state="visible", timeout=_remaining_ms(deadline))
+        dom.wait_for(state="visible", timeout=_tw(_remaining_ms(deadline)))
     except PlaywrightTimeoutError as e:
         raise IrisFlowError(
             "HUMAN_CAPTCHA_WAIT",
@@ -628,10 +641,10 @@ def step_dashboard(cfg: dict[str, Any]) -> None:
     label = (cfg.get("iris_simplified_return_click") or "").strip() or None
 
     if label:
-        page.get_by_text(str(label), exact=False).first.click(timeout=30_000)
+        page.get_by_text(str(label), exact=False).first.click(timeout=_T)
         log_step("DASHBOARD", "opened Simplified Return tile", "success", "NVIDIA-derived label")
     else:
-        page.get_by_text(_SIMPLIFIED_RETURN_PHRASE_RE).first.click(timeout=30_000)
+        page.get_by_text(_SIMPLIFIED_RETURN_PHRASE_RE).first.click(timeout=_T)
         log_step("DASHBOARD", "opened Simplified Return tile", "success", "default phrase")
 
 
@@ -698,11 +711,11 @@ def step_tax_period(cfg: dict[str, Any]) -> None:
     label = cfg.get("tax_period_label") or ""
     if label:
         try:
-            page.get_by_text(label, exact=False).first.click(timeout=10_000)
+            page.get_by_text(label, exact=False).first.click(timeout=_T)
         except Exception:
             page.get_by_role(
                 "option", name=re.compile(re.escape(label[:20]), re.I)
-            ).first.click(timeout=10_000)
+            ).first.click(timeout=_T)
     else:
         # Prefer IRIS_TAX_PERIOD_LABEL in .env for reliable selection.
         opened = False
@@ -710,7 +723,7 @@ def step_tax_period(cfg: dict[str, Any]) -> None:
             trig = page.locator(sel)
             if trig.count() > 0:
                 try:
-                    trig.first.click(timeout=5_000)
+                    trig.first.click(timeout=_T)
                     page.wait_for_timeout(500)
                     opened = True
                     break
@@ -719,13 +732,13 @@ def step_tax_period(cfg: dict[str, Any]) -> None:
         if opened:
             opt = page.get_by_role("option", name=re.compile(re.escape(tax_year), re.I))
             if opt.count() > 0:
-                opt.first.click(timeout=15_000)
+                opt.first.click(timeout=_T)
             else:
                 page.locator("li").filter(
                     has_text=re.compile(re.escape(tax_year), re.I)
-                ).first.click(timeout=15_000)
+                ).first.click(timeout=_T)
 
-    page.get_by_role("button", name=re.compile(r"continue", re.I)).click(timeout=20_000)
+    page.get_by_role("button", name=re.compile(r"continue", re.I)).click(timeout=_T)
     page.wait_for_timeout(2000)
 
     if page.locator("body").get_by_text(re.compile(r"already.*submitted", re.I)).count():
@@ -746,7 +759,7 @@ def step_tax_period(cfg: dict[str, Any]) -> None:
 
 def _try_click_en(page: Page) -> None:
     try:
-        page.get_by_role("button", name=re.compile(r"^EN$", re.I)).first.click(timeout=4_000)
+        page.get_by_role("button", name=re.compile(r"^EN$", re.I)).first.click(timeout=_T)
         page.wait_for_timeout(400)
     except Exception:
         pass
@@ -755,13 +768,13 @@ def _try_click_en(page: Page) -> None:
 def _click_yes_residency(page: Page) -> None:
     try:
         page.get_by_role("button", name=re.compile(r"^\s*Yes\s*$", re.I)).first.click(
-            timeout=15_000
+            timeout=_T
         )
         return
     except Exception:
         pass
     page.locator("button, span.p-button-label, a").filter(has_text=re.compile(r"^\s*Yes\s*$", re.I)).first.click(
-        timeout=15_000
+        timeout=_T
     )
 
 
@@ -769,17 +782,17 @@ def _click_save_toolbar(page: Page) -> None:
     try:
         page.locator("header, .layout-topbar, .toolbar, p-toolbar").get_by_text(
             re.compile(r"^Save$", re.I)
-        ).first.click(timeout=12_000)
+        ).first.click(timeout=_T)
         page.wait_for_timeout(600)
         return
     except Exception:
         pass
-    page.get_by_text(re.compile(r"^Save$", re.I)).first.click(timeout=12_000)
+    page.get_by_text(re.compile(r"^Save$", re.I)).first.click(timeout=_T)
     page.wait_for_timeout(600)
 
 
 def _click_continue_wizard(page: Page) -> None:
-    page.get_by_role("button", name=re.compile(r"Continue", re.I)).first.click(timeout=20_000)
+    page.get_by_role("button", name=re.compile(r"Continue", re.I)).first.click(timeout=_T)
     page.wait_for_timeout(800)
 
 
@@ -797,10 +810,10 @@ def step_income_sources() -> None:
     page.wait_for_timeout(800)
     # Salary tile / radio / card
     try:
-        page.get_by_text(re.compile(r"^\s*Salary\s*$", re.I)).first.click(timeout=15_000)
+        page.get_by_text(re.compile(r"^\s*Salary\s*$", re.I)).first.click(timeout=_T)
     except Exception:
         page.locator("label, span, div").filter(has_text=re.compile(r"^\s*Salary\s*$", re.I)).first.click(
-            timeout=15_000
+            timeout=_T
         )
     page.wait_for_timeout(400)
     # "Other sources" → No
@@ -809,14 +822,14 @@ def step_income_sources() -> None:
             has_text=re.compile(r"any other sources", re.I)
         )
         row.get_by_role("button", name=re.compile(r"^\s*No\s*$", re.I)).first.click(
-            timeout=15_000
+            timeout=_T
         )
     except Exception:
         page.get_by_role("button", name=re.compile(r"^\s*No\s*$", re.I)).nth(1).click(
-            timeout=15_000
+            timeout=_T
         )
     _click_save_toolbar(page)
-    page.get_by_role("button", name=re.compile(r"^Next$", re.I)).first.click(timeout=20_000)
+    page.get_by_role("button", name=re.compile(r"^Next$", re.I)).first.click(timeout=_T)
     page.wait_for_timeout(1000)
     log_step("INCOME_SOURCES", "Salary selected, other sources No, Save, Next", "success", "")
 
@@ -856,11 +869,11 @@ def step_income_details_salary(cfg: dict[str, Any]) -> None:
         page.get_by_role(
             "checkbox",
             name=re.compile(r"can.*t find employer|cannot find employer", re.I),
-        ).first.check(timeout=15_000)
+        ).first.check(timeout=_T)
     except Exception:
         try:
             page.get_by_text(re.compile(r"can.*t find employer", re.I)).first.click(
-                timeout=10_000
+                timeout=_T
             )
         except Exception as e:
             raise IrisFlowError(
@@ -873,7 +886,7 @@ def step_income_details_salary(cfg: dict[str, Any]) -> None:
 
     def fill_label(pattern: str, value: str | int | float) -> None:
         loc = page.get_by_label(re.compile(pattern, re.I)).first
-        loc.wait_for(state="visible", timeout=20_000)
+        loc.wait_for(state="visible", timeout=_T)
         loc.fill("")
         loc.fill(str(value))
 
@@ -905,7 +918,7 @@ def step_income_details_salary(cfg: dict[str, Any]) -> None:
 
     if arrears in ("yes", "y", "true", "1"):
         page.get_by_role("button", name=re.compile(r"^\s*Yes\s*$", re.I)).nth(0).click(
-            timeout=10_000
+            timeout=_T
         )
     else:
         try:
@@ -913,15 +926,15 @@ def step_income_details_salary(cfg: dict[str, Any]) -> None:
                 has_text=re.compile(r"salary arrears|termination benefits", re.I)
             )
             block.get_by_role("button", name=re.compile(r"^\s*No\s*$", re.I)).first.click(
-                timeout=10_000
+                timeout=_T
             )
         except Exception:
             page.get_by_role("button", name=re.compile(r"^\s*No\s*$", re.I)).first.click(
-                timeout=10_000
+                timeout=_T
             )
 
     _click_save_toolbar(page)
-    page.get_by_role("button", name=re.compile(r"^Next$", re.I)).first.click(timeout=20_000)
+    page.get_by_role("button", name=re.compile(r"^Next$", re.I)).first.click(timeout=_T)
     log_step(
         "INCOME_DETAILS_SALARY",
         "salary section filled, Save, Next",

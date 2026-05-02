@@ -32,7 +32,11 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 NVIDIA_INVOKE_URL = os.getenv("NVIDIA_INVOKE_URL")
 # build.nvidia.com default; set NVIDIA_MODEL in .env if NVIDIA rotates catalog ids.
 NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "google/gemma-3-27b-it").strip()
-stream=True
+stream = True
+
+# Playwright action / navigation defaults (ms)
+_DEFAULT_MS = int(os.getenv("IRIS_TIMEOUT_MS", "10000"))
+_NVIDIA_HTTP_TIMEOUT_S = max(5, _DEFAULT_MS // 1000)
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -166,8 +170,10 @@ def _require_page() -> Page:
 #     page.goto(url, wait_until="domcontentloaded", timeout=timeout)
 #     page.wait_for_timeout(800)
 
-def playwright_goto(url: str, timeout: int = 90_000) -> None:
+def playwright_goto(url: str, timeout: int | None = None) -> None:
     page = _require_page()
+    if timeout is None:
+        timeout = _DEFAULT_MS
     failures: list[str] = []
 
     def _on_request_failed(request: Request) -> None:
@@ -190,7 +196,7 @@ def playwright_goto(url: str, timeout: int = 90_000) -> None:
         except Exception:
             pass
 
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(min(1000, max(200, _DEFAULT_MS // 10)))
 
     if failures:
         print("[goto] requestfailed events:")
@@ -208,22 +214,25 @@ def playwright_goto(url: str, timeout: int = 90_000) -> None:
         print(f"[warn] playwright_goto: page body is empty after loading {url}")
         print(f"[warn] current url: {page.url!r} | title: {page.title()!r}")
 
-def playwright_click(selector: str, timeout: int = 30_000) -> None:
+def playwright_click(selector: str, timeout: int | None = None) -> None:
     page = _require_page()
-    page.locator(selector).first.click(timeout=timeout)
+    t = timeout if timeout is not None else _DEFAULT_MS
+    page.locator(selector).first.click(timeout=t)
 
 
-def playwright_fill(selector: str, value: str, timeout: int = 30_000) -> None:
+def playwright_fill(selector: str, value: str, timeout: int | None = None) -> None:
     page = _require_page()
+    t = timeout if timeout is not None else _DEFAULT_MS
     loc = page.locator(selector).first
-    loc.wait_for(state="visible", timeout=timeout)
-    loc.fill("", timeout=timeout)
-    loc.fill(str(value), timeout=timeout)
+    loc.wait_for(state="visible", timeout=t)
+    loc.fill("", timeout=t)
+    loc.fill(str(value), timeout=t)
 
 
-def playwright_check(selector: str, timeout: int = 30_000) -> None:
+def playwright_check(selector: str, timeout: int | None = None) -> None:
     page = _require_page()
-    page.locator(selector).first.check(timeout=timeout)
+    t = timeout if timeout is not None else _DEFAULT_MS
+    page.locator(selector).first.check(timeout=t)
 
 
 def playwright_screenshot() -> str:
@@ -234,9 +243,10 @@ def playwright_screenshot() -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
-def playwright_wait(selector: str, timeout: int = 30_000) -> None:
+def playwright_wait(selector: str, timeout: int | None = None) -> None:
     page = _require_page()
-    page.locator(selector).first.wait_for(state="visible", timeout=timeout)
+    t = timeout if timeout is not None else _DEFAULT_MS
+    page.locator(selector).first.wait_for(state="visible", timeout=t)
 
 
 def capsolver_solve(image_b64: str) -> str:
@@ -280,7 +290,7 @@ def vision_identify(screenshot_b64: str, question: str) -> dict[str, Any]:
     }
     try:
         response = requests.post(
-            NVIDIA_INVOKE_URL, headers=headers, json=payload, timeout=60
+            NVIDIA_INVOKE_URL, headers=headers, json=payload, timeout=_NVIDIA_HTTP_TIMEOUT_S
         )
         response.raise_for_status()
     except requests.RequestException as e:

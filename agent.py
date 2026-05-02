@@ -112,7 +112,10 @@ Focus on: layout, headings, buttons, forms, key messages, and page structure.
 
     try:
         response = requests.post(
-            NVIDIA_INVOKE_URL, headers=headers, json=payload, timeout=60
+            NVIDIA_INVOKE_URL,
+            headers=headers,
+            json=payload,
+            timeout=max(5, int(os.getenv("IRIS_TIMEOUT_MS", "10000")) // 1000),
         )
         response.raise_for_status()
     except requests.RequestException as e:

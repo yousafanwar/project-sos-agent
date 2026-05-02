@@ -51,7 +51,9 @@ def fetch_webpage_text(url: str) -> dict:
         session = requests.Session()
         session.headers.update(BROWSER_HEADERS)
 
-        response = session.get(url, timeout=15, allow_redirects=True)
+        response = session.get(
+            url, timeout=max(5, int(os.getenv("IRIS_TIMEOUT_MS", "10000")) // 1000), allow_redirects=True
+        )
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
@@ -109,10 +111,11 @@ def screenshot_webpage(url: str, path: str = "screenshot.jpg") -> dict:
             if STEALTH_AVAILABLE:
                 stealth_sync(page)
 
-            page.goto(url, wait_until="networkidle", timeout=30_000)
+            _nav_ms = int(os.getenv("IRIS_TIMEOUT_MS", "10000"))
+            page.goto(url, wait_until="networkidle", timeout=_nav_ms)
 
             # Brief pause — lets JS-rendered content settle
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(min(1000, max(200, _nav_ms // 10)))
 
             page.screenshot(
                 path=path,
